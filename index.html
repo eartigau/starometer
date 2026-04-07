@@ -410,13 +410,23 @@
     <div class="card">
       <h1>STAR-O-METER</h1>
       <p>
-        Enter a stellar identifier (SIMBAD-resolvable name or alias). The tool cross-matches
-        astrometry and broadband photometry from <strong>Gaia DR3</strong>, <strong>2MASS</strong>,
-        and <strong>AllWISE</strong> (0.5&#8211;22&nbsp;&#956;m). For M dwarfs it applies the existing
-        empirical calibrations; for earlier main-sequence stars it uses Gaia DR3 astrophysical
-        parameters explicitly labeled in the output.
-        the spectral energy distribution and Hertzsprung&#8211;Russell diagram position
-        relative to the solar-neighbourhood sample (&lt;20&nbsp;pc) are displayed below.
+        Enter a stellar identifier resolvable by <strong>SIMBAD</strong>, for example a common name,
+        Bayer/Flamsteed designation, Gliese name, or Gaia-compatible alias. The tool fetches
+        astrometry and broadband photometry from <strong>Gaia DR3</strong>, <strong>2MASS</strong>, and
+        <strong>AllWISE</strong>, then reports coordinates, kinematics, and empirical stellar parameters.
+      </p>
+
+      <p>
+        The stellar-parameter part of the tool is intended for <strong>main-sequence stars only</strong>.
+        M dwarfs use the dedicated empirical relations already implemented here; AFGK dwarfs use
+        Gaia DR3 stellar parameters when available, otherwise an empirical dwarf-sequence fallback.
+        If the target is a white dwarf, giant, subgiant, or another non-main-sequence object, the
+        page will warn you and will not compute derived stellar quantities.
+      </p>
+
+      <p>
+        The spectral energy distribution and Hertzsprung&#8211;Russell diagram position relative to the
+        solar-neighbourhood sample (&lt;20&nbsp;pc) are displayed below when enough photometry is available.
       </p>
 
       <div class="row">
@@ -439,6 +449,76 @@
       <div id="hr_plot" style="margin-top:0.5rem;"></div>
     </div>
   </div>
+
+  <script>
+    (function () {
+      function decodeTarget(value) {
+        if (!value) {
+          return null;
+        }
+        try {
+          return decodeURIComponent(value.replace(/\+/g, ' ')).trim() || null;
+        } catch {
+          return value.trim() || null;
+        }
+      }
+
+      function extractTargetFromUrl() {
+        const url = new URL(window.location.href);
+        for (const key of ['target', 'name', 'id', 'q']) {
+          const queryValue = url.searchParams.get(key);
+          if (queryValue) {
+            return decodeTarget(queryValue);
+          }
+        }
+
+        const hash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
+        if (!hash) {
+          return null;
+        }
+
+        const hashParams = new URLSearchParams(hash);
+        for (const key of ['target', 'name', 'id', 'q']) {
+          const hashValue = hashParams.get(key);
+          if (hashValue) {
+            return decodeTarget(hashValue);
+          }
+        }
+
+        return decodeTarget(hash);
+      }
+
+      const target = extractTargetFromUrl();
+      if (!target) {
+        return;
+      }
+
+      window.addEventListener('DOMContentLoaded', function () {
+        const input = document.getElementById('target_name');
+        if (input && !input.value) {
+          input.value = target;
+        }
+
+        const status = document.getElementById('status');
+        if (!status) {
+          return;
+        }
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'msg ok';
+
+        const spinner = document.createElement('span');
+        spinner.className = 'spinner';
+
+        const label = document.createElement('span');
+        label.textContent = "Received target from URL: '" + target + "'. Preparing lookup...";
+
+        wrapper.appendChild(spinner);
+        wrapper.appendChild(label);
+        status.replaceChildren(wrapper);
+      });
+    })();
+  </script>
 
     <script type="py" config='{
     "packages": ["pandas"]
