@@ -820,10 +820,6 @@
     if target_input is None:
       return
 
-    current_value = normalize_value(target_input.value)
-    if not force and current_value == target:
-      return
-
     target_input.value = target
     set_status(f"Fetching information for target '{target}'...", "ok", loading=True)
     await run_lookup()
