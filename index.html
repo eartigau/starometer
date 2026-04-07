@@ -1076,6 +1076,12 @@
     return m_ks, ""
 
 
+  def compute_distance_pc_from_parallax(parallax_mas):
+    if parallax_mas is None or parallax_mas <= 0:
+      return None
+    return 1000.0 / parallax_mas
+
+
   def compute_absolute_g(data):
     plx_mas = parse_float(data.get("parallax_mas"))
     g_mag = parse_float(data.get("G_mag"))
@@ -2169,6 +2175,15 @@
           dec_text = format_dec_sexagesimal(parse_float(v))
           raw_deg = "" if v is None else html.escape(str(v))
           cell = "" if dec_text is None else f'<span class="value-wrap" title="{raw_deg} deg">{dec_text}</span>'
+        elif k == "parallax_mas":
+          parallax_value = parse_float(v)
+          distance_pc = compute_distance_pc_from_parallax(parallax_value)
+          if v is None:
+            cell = ""
+          elif distance_pc is None:
+            cell = f'<span class="value-wrap">{v}</span>'
+          else:
+            cell = f'<span class="value-wrap">{v} ({distance_pc:.1f} pc)</span>'
         else:
           cell = "" if v is None else f'<span class="value-wrap">{v}</span>'
         if k in EDITABLE_KEYS:
