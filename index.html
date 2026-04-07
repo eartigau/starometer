@@ -233,6 +233,20 @@
       white-space: nowrap;
     }
 
+    /* Row-group tinting: same quantity measured multiple ways */
+    tr.grp-teff th  { background: #3b2010; }
+    tr.grp-teff td  { background: #261508; }
+    tr.grp-rad  th  { background: #2a1f10; }
+    tr.grp-rad  td  { background: #1c1508; }
+    tr.grp-mass th  { background: #102030; }
+    tr.grp-mass td  { background: #08131e; }
+    tr.grp-wise th  { background: #201030; }
+    tr.grp-wise td  { background: #160820; }
+    tr.grp-kin  th  { background: #102520; }
+    tr.grp-kin  td  { background: #081a16; }
+    tr.grp-uvw  th  { background: #1a1030; }
+    tr.grp-uvw  td  { background: #100820; }
+
     /* Keep MathJax labels compact on a single line in table headers/cells. */
     table .mjx-container[display="true"] {
       display: inline-block !important;
@@ -264,16 +278,26 @@
       white-space: nowrap;
     }
 
+    .value-wrap a {
+      color: var(--accent-2);
+      text-decoration: none;
+    }
+
+    .value-wrap a:hover {
+      text-decoration: underline;
+    }
+
     .msg {
       margin-top: 0.8rem;
       font-size: 0.95rem;
       padding: 0.55rem 0.65rem;
       border-radius: 8px;
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       gap: 0.55rem;
-      white-space: nowrap;
-      overflow-x: auto;
+      white-space: normal;
+      word-break: break-word;
+      overflow-x: visible;
       overflow-y: hidden;
     }
 
@@ -416,6 +440,7 @@
   import math
   import asyncio
   import json
+  import html
   from urllib.parse import quote_plus
 
   from js import document, window
@@ -431,7 +456,7 @@
   DUQUE_FEH_SIGMA_DEX = 0.10
   MANN_RADIUS_FRAC_SIGMA = 0.03
   MANN_MASS_FRAC_SIGMA = 0.02
-  TEFF_COLOR_SIGMA_K = 100
+  TEFF_COLOR_SIGMA_K = 52
   M_G_MDWARF_MIN = 7.5
   M_G_MDWARF_MAX = 16.5
   HR_BG_DATA = None  # cached <20 pc Gaia sample for HR diagram
@@ -459,6 +484,16 @@
   ]
   EDITING_KEYS = set()
   DYNAMIC_PROXIES = []
+  OBLIQUITY_DEG = 23.4392911
+  EARTH_ORBITAL_SPEED_KMS = 29.79
+  PROBLEMATIC_RV_THRESHOLD_KMS = 5.0
+  NON_LEAP_MONTH_LENGTHS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  NON_LEAP_MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  EQUATORIAL_TO_GALACTIC_MATRIX = [
+    [-0.0548755604, -0.8734370902, -0.4838350155],
+    [0.4941094279, -0.4448296300, 0.7469822445],
+    [-0.8676661490, -0.1980763734, 0.4559837762],
+  ]
 
 
   def set_status(message, level="ok", loading=False):
@@ -571,6 +606,202 @@
       return None
 
 
+  def build_simbad_object_url(identifier):
+    sval = normalize_value(identifier)
+    if sval is None:
+      return None
+    return f"https://simbad.cds.unistra.fr/simbad/sim-id?Ident={quote_plus(sval)}"
+
+
+  def format_ra_sexagesimal(ra_deg):
+    if ra_deg is None:
+      return None
+    total_seconds = (ra_deg % 360.0) * 240.0
+    hours = int(total_seconds // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+    seconds = total_seconds - 3600 * hours - 60 * minutes
+    if seconds >= 59.995:
+      seconds = 0.0
+      minutes += 1
+    if minutes >= 60:
+      minutes = 0
+      hours = (hours + 1) % 24
+    return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
+
+
+  def format_dec_sexagesimal(dec_deg):
+    if dec_deg is None:
+      return None
+    sign = "+" if dec_deg >= 0 else "-"
+    total_arcsec = abs(dec_deg) * 3600.0
+    degrees = int(total_arcsec // 3600)
+    minutes = int((total_arcsec % 3600) // 60)
+    seconds = total_arcsec - 3600 * degrees - 60 * minutes
+    if seconds >= 59.995:
+      seconds = 0.0
+      minutes += 1
+    if minutes >= 60:
+      minutes = 0
+      degrees += 1
+    return f"{sign}{degrees:02d}:{minutes:02d}:{seconds:05.2f}"
+
+
+  def compute_galactic_longitude_latitude(ra_deg, dec_deg):
+    if ra_deg is None or dec_deg is None:
+      return None, None
+
+    ra_r = math.radians(ra_deg)
+    dec_r = math.radians(dec_deg)
+    eq_vec = [
+      math.cos(dec_r) * math.cos(ra_r),
+      math.cos(dec_r) * math.sin(ra_r),
+      math.sin(dec_r),
+    ]
+    gal_vec = [
+      sum(EQUATORIAL_TO_GALACTIC_MATRIX[i][j] * eq_vec[j] for j in range(3))
+      for i in range(3)
+    ]
+    gal_lon = math.degrees(math.atan2(gal_vec[1], gal_vec[0])) % 360.0
+    gal_lat = math.degrees(math.asin(max(-1.0, min(1.0, gal_vec[2]))))
+    return gal_lon, gal_lat
+
+
+  def compute_ecliptic_longitude_latitude(ra_deg, dec_deg):
+    if ra_deg is None or dec_deg is None:
+      return None, None
+
+    ra_r = math.radians(ra_deg)
+    dec_r = math.radians(dec_deg)
+    eps_r = math.radians(OBLIQUITY_DEG)
+    sin_beta = math.sin(dec_r) * math.cos(eps_r) - math.cos(dec_r) * math.sin(eps_r) * math.sin(ra_r)
+    beta_r = math.asin(max(-1.0, min(1.0, sin_beta)))
+    y = math.sin(ra_r) * math.cos(eps_r) + math.tan(dec_r) * math.sin(eps_r)
+    x = math.cos(ra_r)
+    lambda_r = math.atan2(y, x)
+    return math.degrees(lambda_r) % 360.0, math.degrees(beta_r)
+
+
+  def day_of_year_to_label(day_index):
+    day_number = day_index + 1
+    remaining = day_number
+    for month_name, month_length in zip(NON_LEAP_MONTH_NAMES, NON_LEAP_MONTH_LENGTHS):
+      if remaining <= month_length:
+        return f"{month_name} {remaining:02d}"
+      remaining -= month_length
+    return "Dec 31"
+
+
+  def summarize_problematic_rv_windows(ra_deg, dec_deg, rv_kms):
+    ecl_lon_deg, ecl_lat_deg = compute_ecliptic_longitude_latitude(ra_deg, dec_deg)
+    if ecl_lon_deg is None or ecl_lat_deg is None or rv_kms is None:
+      return ecl_lon_deg, ecl_lat_deg, None
+
+    daily_values = []
+    flagged_days = []
+    for day_index in range(365):
+      sun_lon_deg = ((day_index + 1) - 80.0) * 360.0 / 365.0
+      v_orb = EARTH_ORBITAL_SPEED_KMS * math.cos(math.radians(ecl_lat_deg)) * math.sin(math.radians(sun_lon_deg - ecl_lon_deg))
+      v_total = rv_kms + v_orb
+      daily_values.append(v_total)
+      flagged_days.append(abs(v_total) < PROBLEMATIC_RV_THRESHOLD_KMS)
+
+    ranges = []
+    start_index = None
+    for day_index, is_flagged in enumerate(flagged_days):
+      if is_flagged and start_index is None:
+        start_index = day_index
+      elif not is_flagged and start_index is not None:
+        ranges.append((start_index, day_index - 1))
+        start_index = None
+    if start_index is not None:
+      ranges.append((start_index, 364))
+
+    if len(ranges) > 1 and flagged_days[0] and flagged_days[-1]:
+      first_start, first_end = ranges[0]
+      last_start, last_end = ranges[-1]
+      ranges = [(last_start, first_end)] + ranges[1:-1]
+
+    min_abs_speed = min(abs(v_total) for v_total in daily_values)
+    min_days = [day_index for day_index, v_total in enumerate(daily_values) if abs(abs(v_total) - min_abs_speed) < 1e-9]
+    min_labels = ", ".join(day_of_year_to_label(day_index) for day_index in min_days[:3])
+
+    if not ranges:
+      summary = (
+        f"No day reaches |v<sub>sys</sub> + v<sub>bary,orb</sub>| &lt; {PROBLEMATIC_RV_THRESHOLD_KMS:.0f} km/s; "
+        f"closest approach is {min_abs_speed:.2f} km/s on {min_labels}."
+      )
+      return ecl_lon_deg, ecl_lat_deg, summary
+
+    segments = []
+    for start_day, end_day in ranges:
+      if start_day == end_day:
+        segments.append(day_of_year_to_label(start_day))
+      else:
+        segments.append(f"{day_of_year_to_label(start_day)} to {day_of_year_to_label(end_day)}")
+
+    summary = (
+      f"Days with |v<sub>sys</sub> + v<sub>bary,orb</sub>| &lt; {PROBLEMATIC_RV_THRESHOLD_KMS:.0f} km/s: "
+      f"{' ; '.join(segments)}. Closest approach: {min_abs_speed:.2f} km/s on {min_labels}."
+    )
+    return ecl_lon_deg, ecl_lat_deg, summary
+
+
+  def recompute_kinematic_fields(data):
+    plx = parse_float(data.get("parallax_mas"))
+    pmra_v = parse_float(data.get("gaia_pmra_masyr"))
+    pmdec_v = parse_float(data.get("gaia_pmdec_masyr"))
+    rv_val = parse_float(data.get("rv_kms"))
+    ra_v = parse_float(data.get("ra_deg"))
+    dec_v = parse_float(data.get("dec_deg"))
+
+    if plx is not None and plx > 0 and pmra_v is not None and pmdec_v is not None:
+      mu_tot = math.sqrt(pmra_v**2 + pmdec_v**2)
+      d_pc = 1000.0 / plx
+      vsky = 4.74047 * d_pc * mu_tot / 1000.0
+      data["vsky_kms"] = f"{vsky:.2f}"
+      if rv_val is not None:
+        v3d = math.sqrt(vsky**2 + rv_val**2)
+        data["v3d_kms"] = f"{v3d:.2f}"
+      else:
+        data["v3d_kms"] = None
+    else:
+      data["vsky_kms"] = None
+      data["v3d_kms"] = None
+
+    if (ra_v is None or dec_v is None or plx is None or plx <= 0
+        or pmra_v is None or pmdec_v is None or rv_val is None):
+      data["U_kms"] = None
+      data["V_kms"] = None
+      data["W_kms"] = None
+      return
+
+    ra_r = math.radians(ra_v)
+    dec_r = math.radians(dec_v)
+    d_pc = 1000.0 / plx
+    k = 4.74047
+    cos_ra = math.cos(ra_r)
+    sin_ra = math.sin(ra_r)
+    cos_dec = math.cos(dec_r)
+    sin_dec = math.sin(dec_r)
+    a_matrix = [
+      [-sin_ra, -cos_ra * sin_dec, cos_ra * cos_dec],
+      [cos_ra, -sin_ra * sin_dec, sin_ra * cos_dec],
+      [0.0, cos_dec, sin_dec],
+    ]
+    velocity_components = [
+      k * d_pc * pmra_v / 1000.0,
+      k * d_pc * pmdec_v / 1000.0,
+      rv_val,
+    ]
+    v_eq = [sum(a_matrix[i][j] * velocity_components[j] for j in range(3)) for i in range(3)]
+    u_kms = sum(EQUATORIAL_TO_GALACTIC_MATRIX[0][j] * v_eq[j] for j in range(3))
+    v_kms = sum(EQUATORIAL_TO_GALACTIC_MATRIX[1][j] * v_eq[j] for j in range(3))
+    w_kms = sum(EQUATORIAL_TO_GALACTIC_MATRIX[2][j] * v_eq[j] for j in range(3))
+    data["U_kms"] = f"{u_kms:.2f}"
+    data["V_kms"] = f"{v_kms:.2f}"
+    data["W_kms"] = f"{w_kms:.2f}"
+
+
   def compute_absolute_k(data):
     plx_mas = parse_float(data.get("parallax_mas"))
     k_mag = parse_float(data.get("K_mag"))
@@ -634,17 +865,41 @@
     """
     m_ks, mk_note = compute_absolute_k(data)
     if m_ks is None:
-      return None, None, None, None, None, None, mk_note
+      return None, None, None, None, None, None, None, None, "", None, None, mk_note
 
-    # Mann+15 Table 1 radius polynomial in M_Ks
-    r_star = 1.2102 - 0.17980 * m_ks + 0.008148 * (m_ks ** 2)
+    # Mann+15 Table 1 row 1: R* = a + b*M_Ks + c*M_Ks^2 (sigma=2.89%)
+    r_star = 1.9515 - 0.3520 * m_ks + 0.01680 * (m_ks ** 2)
     if r_star <= 0:
-      return None, None, None, None, None, None, "Derived <strong>R<sub>&#x2605;</sub></strong> is non-physical for this <strong>M<sub>Ks</sub></strong>."
+      return None, None, None, None, None, None, None, None, "", None, None, "Derived <strong>R<sub>&#x2605;</sub></strong> is non-physical for this <strong>M<sub>Ks</sub></strong>."
 
-    # Mann+15 Table 1 mass-luminosity polynomial in M_Ks
-    m_star = 0.9560 - 0.08390 * m_ks + 0.000556 * (m_ks ** 2)
+    # Mann+15 Table 1 row 2: R* = a + b*M_Ks + c*M_Ks^2 + f*[Fe/H] (sigma=2.70%)
+    feh_str = data.get("feh_duque_dex")
+    feh_val = parse_float(feh_str.split("\u00b1")[0].strip()) if feh_str else None
+    if feh_val is not None:
+      r_star_feh = 1.9305 - 0.3466 * m_ks + 0.01647 * (m_ks ** 2) + 0.04458 * feh_val
+      sigma_r_feh = 0.0270 * r_star_feh
+    else:
+      r_star_feh = None
+      sigma_r_feh = None
+
+    # Mann+15 Table 1 row 5: M* = a + b*M_Ks + ... (sigma=1.8%)
+    m_star = (0.5858 + 0.3872 * m_ks - 0.1217 * (m_ks ** 2)
+              + 0.0106 * (m_ks ** 3) - 2.7262e-4 * (m_ks ** 4))
     if m_star <= 0:
-      return None, None, None, None, None, None, "Derived <strong>M<sub>&#x2605;</sub></strong> is non-physical for this <strong>M<sub>Ks</sub></strong>."
+      return None, None, None, None, None, None, None, None, "", None, None, "Derived <strong>M<sub>&#x2605;</sub></strong> is non-physical for this <strong>M<sub>Ks</sub></strong>."
+
+    # Delfosse+2000 M_K mass: log(M/Msun) = 1e-3*(1.8 + 6.12*X + 13.205*X^2 - 6.2315*X^3 + 0.37529*X^4)
+    # valid for M_K in [4.5, 9.5]
+    DELFOSSE_MK_MIN, DELFOSSE_MK_MAX = 4.5, 9.5
+    if DELFOSSE_MK_MIN <= m_ks <= DELFOSSE_MK_MAX:
+      log_m_del = 1e-3 * (1.8 + 6.12*m_ks + 13.205*m_ks**2 - 6.2315*m_ks**3 + 0.37529*m_ks**4)
+      m_del = 10.0 ** log_m_del
+      sigma_m_del = 0.10 * m_del   # ~10% scatter quoted by Delfosse+2000
+      del_note = ""
+    else:
+      m_del = None
+      sigma_m_del = None
+      del_note = f"&#9888; M<sub>Ks</sub>={m_ks:.2f} outside Delfosse+2000 range [{DELFOSSE_MK_MIN},{DELFOSSE_MK_MAX}]."
 
     sigma_r = MANN_RADIUS_FRAC_SIGMA * r_star
     sigma_m = MANN_MASS_FRAC_SIGMA * m_star
@@ -653,38 +908,52 @@
     logg = logg_sun + math.log10(m_star) - 2.0 * math.log10(r_star)
     ln10 = math.log(10.0)
     sigma_logg = math.sqrt((sigma_m / (m_star * ln10)) ** 2 + (2.0 * sigma_r / (r_star * ln10)) ** 2)
-    return r_star, sigma_r, m_star, sigma_m, logg, sigma_logg, ""
+    return r_star, sigma_r, r_star_feh, sigma_r_feh, m_star, sigma_m, m_del, sigma_m_del, del_note, logg, sigma_logg, ""
 
 
   def compute_teff_from_color(data):
     """
-    Photometric T_eff from G_BP - G_RP using a quadratic polynomial calibrated on the
-    Pecaut & Mamajek (2013, ApJS 208, 9) M-dwarf color–temperature sequence.
-    Accurate to ~100 K for spectral types M0–M6 (G_BP-G_RP in 1.5–3.5).
+    Returns two Teff estimates from Mann et al. (2015, ApJ 804, 64) Table 2:
+      teff1: row 11, BP-RP + J-H (sigma=49 K) — None if J/H missing
+      teff2: row  1, BP-RP only   (sigma=52 K)
+    Each returned as (teff, sigma, note).
     """
     gbp = parse_float(data.get("GBP_mag"))
     grp = parse_float(data.get("GRP_mag"))
+    j_mag = parse_float(data.get("J_mag"))
+    h_mag = parse_float(data.get("H_mag"))
+
     if gbp is None or grp is None:
-      return None, None, "Missing <strong>G<sub>BP</sub></strong> or <strong>G<sub>RP</sub></strong> for T<sub>eff</sub>."
+      msg = "Missing <strong>G<sub>BP</sub></strong> or <strong>G<sub>RP</sub></strong> for T<sub>eff</sub>."
+      return (None, None, msg), (None, None, msg)
+
     col = gbp - grp
-    if col < 1.2:
-      return None, None, f"G<sub>BP</sub>&#8722;G<sub>RP</sub> = {col:.2f} is outside the valid M-dwarf range (&gt;1.2)."
-    if col > 5.5:
-      return None, None, f"G<sub>BP</sub>&#8722;G<sub>RP</sub> = {col:.2f} is too red for a reliable T<sub>eff</sub> estimate."
-    # Pecaut & Mamajek (2013) quadratic, calibrated M0–M6 (col 1.2–4.0).
-    # Extended to M7–M9 (col 4.0–5.5) using late-M anchor points from
-    # Filippazzo et al. (2015, ApJ 810, 158): linear bridge anchored at
-    # (col=4.0, Teff=2600 K) and (col=5.5, Teff=2300 K).
-    if col <= 4.0:
-      teff = 4410.0 - 255.0 * col - 70.4 * col ** 2
-      sigma = TEFF_COLOR_SIGMA_K
-      note = ""
+    if col < 1.5:
+      msg = f"G<sub>BP</sub>&#8722;G<sub>RP</sub> = {col:.2f} is outside the valid M-dwarf range (&gt;1.5)."
+      return (None, None, msg), (None, None, msg)
+    if col > 4.5:
+      msg = f"G<sub>BP</sub>&#8722;G<sub>RP</sub> = {col:.2f} is too red for the Mann et al. (2015) calibration."
+      return (None, None, msg), (None, None, msg)
+
+    limit_note = ""
+    if col > 3.8:
+      limit_note = f"&#9888; Near calibration limit (G<sub>BP</sub>&#8722;G<sub>RP</sub>={col:.2f}); &sigma; may be underestimated."
+
+    # Row 11: BP-RP + J-H; sigma=49 K
+    if j_mag is not None and h_mag is not None:
+      jh = j_mag - h_mag
+      a, b, c, d, e, f, g = 3.172, -2.475, 1.082, -0.2231, 0.01738, 0.08776, 0.04355
+      t1 = round(3500.0 * (a + b*col + c*col**2 + d*col**3 + e*col**4 + f*jh + g*jh**2))
+      res1 = (t1, 49, limit_note)
     else:
-      # Linear extension for M7–M9 / L0 boundary
-      teff = round(2600.0 - 200.0 * (col - 4.0))
-      sigma = 150
-      note = f"&#9888; Near calibration limit (G<sub>BP</sub>&#8722;G<sub>RP</sub>={col:.2f}, M7&ndash;M9); &sigma;&#8776;150&thinsp;K."
-    return round(teff), sigma, note
+      res1 = (None, None, "")
+
+    # Row 1: BP-RP only; sigma=52 K
+    a2, b2, c2, d2, e2 = 3.245, -2.4309, 1.043, -0.2127, 0.01649
+    t2 = round(3500.0 * (a2 + b2*col + c2*col**2 + d2*col**3 + e2*col**4))
+    res2 = (t2, TEFF_COLOR_SIGMA_K, limit_note)
+
+    return res1, res2
 
 
 
@@ -964,33 +1233,56 @@
   def recompute_derived_fields(data):
     m_g = compute_absolute_g(data)
     data["M_G_mag"] = None if m_g is None else f"{m_g:.2f}"
+    recompute_kinematic_fields(data)
 
     if m_g is not None and (m_g < M_G_MDWARF_MIN or m_g > M_G_MDWARF_MAX):
       data["teff_K"] = None
+      data["teff_jh_K"] = None
       data["M_Ks_mag"] = None
       data["feh_duque_dex"] = None
       data["radius_rsun"] = None
+      data["radius_feh_rsun"] = None
       data["mass_msun"] = None
+      data["mass_del_msun"] = None
       data["logg_cgs"] = None
+      data["lum_lsun"] = None
       return (
         f"&#9888; <strong>M<sub>G</sub> = {m_g:.2f}</strong> is outside the M-dwarf range "
         f"({M_G_MDWARF_MIN}&#8211;{M_G_MDWARF_MAX} mag); derived parameters not reported.",
         "",
       )
 
-    teff, teff_sigma, teff_note = compute_teff_from_color(data)
-    data["teff_K"] = None if teff is None else f"{teff} \u00b1 {teff_sigma}"
-    data["_teff_sigma"] = teff_sigma  # for dynamic footnote
-
+    # Compute [Fe/H] first so compute_teff_from_color can use it for the r-J,[Fe/H] calibration.
     feh_value, feh_sigma, m_ks, feh_note = compute_duque_feh(data)
-    radius, radius_sigma, mass, mass_sigma, logg, logg_sigma, stellar_note = compute_radius_mass_logg(data)
-
     data["M_Ks_mag"] = None if m_ks is None else f"{m_ks:.3f}"
-    data["feh_duque_dex"] = None if feh_value is None else f"{feh_value:.3f} ± {feh_sigma:.3f}"
-    data["radius_rsun"] = None if radius is None else f"{radius:.3f} ± {radius_sigma:.3f}"
-    data["mass_msun"] = None if mass is None else f"{mass:.3f} ± {mass_sigma:.3f}"
-    data["logg_cgs"] = None if logg is None else f"{logg:.3f} ± {logg_sigma:.3f}"
-    notes = " ".join(n for n in [teff_note, feh_note, stellar_note] if n)
+    data["feh_duque_dex"] = None if feh_value is None else f"{feh_value:.3f} \u00b1 {feh_sigma:.3f}"
+
+    res_jh, res_bprp = compute_teff_from_color(data)
+    teff_jh, sigma_jh, note_jh = res_jh
+    teff_bprp, sigma_bprp, note_bprp = res_bprp
+    data["teff_jh_K"] = None if teff_jh is None else f"{teff_jh} \u00b1 {sigma_jh}"
+    data["teff_K"] = None if teff_bprp is None else f"{teff_bprp} \u00b1 {sigma_bprp}"
+    # propagate note (use J-H note if available, else BP-RP note)
+    teff_note = note_jh if note_jh else note_bprp
+
+    radius, radius_sigma, radius_feh, radius_feh_sigma, mass, mass_sigma, mass_del, mass_del_sigma, del_note, logg, logg_sigma, stellar_note = compute_radius_mass_logg(data)
+
+    data["radius_rsun"] = None if radius is None else f"{radius:.3f} \u00b1 {radius_sigma:.3f}"
+    data["radius_feh_rsun"] = None if radius_feh is None else f"{radius_feh:.3f} \u00b1 {radius_feh_sigma:.3f}"
+    data["mass_msun"] = None if mass is None else f"{mass:.3f} \u00b1 {mass_sigma:.3f}"
+    data["mass_del_msun"] = None if mass_del is None else f"{mass_del:.3f} \u00b1 {mass_del_sigma:.3f}"
+    data["logg_cgs"] = None if logg is None else f"{logg:.3f} \u00b1 {logg_sigma:.3f}"
+
+    # Luminosity: L/Lsun = (R/Rsun)^2 * (Teff/Tsun)^4
+    T_SUN = 5778.0
+    teff_for_lum = parse_float((data.get("teff_jh_K") or data.get("teff_K") or "").split("\u00b1")[0].strip())
+    if radius is not None and teff_for_lum is not None:
+      lum = (radius ** 2) * (teff_for_lum / T_SUN) ** 4
+      data["lum_lsun"] = f"{lum:.4f}"
+    else:
+      data["lum_lsun"] = None
+
+    notes = " ".join(n for n in [teff_note, feh_note, del_note, stellar_note] if n)
     return notes, ""
 
 
@@ -1034,12 +1326,8 @@
 
   def render_table(data):
     hidden_keys = {
-      "ra_deg",
-      "dec_deg",
       "gaia_ra_deg",
       "gaia_dec_deg",
-      "gaia_pmra_masyr",
-      "gaia_pmdec_masyr",
       "gaia_ref_epoch",
       "GBP_err",
       "GRP_err",
@@ -1050,10 +1338,13 @@
       "otype_txt",
       "refs_html",
       "_teff_sigma",
+      "_teff_color",
     }
     labels = {
       "main_id": "Object identifier",
       "sp_type": "Spectral type",
+      "ra_deg": "RA (J2000)",
+      "dec_deg": "DEC (J2000)",
       "parallax_mas": "Parallax [mas]",
       "G_mag": "<strong>G</strong> [mag]",
       "J_mag": "<strong>J</strong> [mag]",
@@ -1067,37 +1358,103 @@
       "W4_mag": "<strong>W4</strong> [mag]",
       "M_G_mag": "<strong>M<sub>G</sub></strong> [mag]",
       "M_Ks_mag": "<strong>M<sub>Ks</sub></strong> [mag]",
-      "teff_K": "<strong>T<sub>eff</sub></strong> [K]<sup title='Pecaut &amp; Mamajek (2013)'>a</sup>",
-      "feh_duque_dex": "<strong>[Fe/H]</strong> [dex]<sup title='Duque-Arribas et al. (2021)'>b</sup>",
-      "radius_rsun": "<strong>R<sub>&#x2605;</sub></strong> [R<sub>&#x2609;</sub>]<sup title='Mann et al. (2015)'>c</sup>",
-      "mass_msun": "<strong>M<sub>&#x2605;</sub></strong> [M<sub>&#x2609;</sub>]<sup title='Mann et al. (2015)'>d</sup>",
+      "teff_jh_K": "<strong>T<sub>eff</sub></strong> (BP&#8722;RP+J&#8722;H) [K]<sup title='Mann et al. (2015) Table 2 row 11'>a1</sup>",
+      "teff_K": "<strong>T<sub>eff</sub></strong> (BP&#8722;RP) [K]<sup title='Mann et al. (2015) Table 2 row 1'>a2</sup>",
+      "feh_duque_dex": "<strong>[Fe/H]</strong> [dex]<sup title='Duque-Arribas et al. (2023)'>b</sup>",
+      "radius_rsun": "<strong>R<sub>&#x2605;</sub></strong> (M<sub>Ks</sub>) [R<sub>&#x2609;</sub>]<sup title='Mann et al. (2015) Table 1 row 1'>c1</sup>",
+      "radius_feh_rsun": "<strong>R<sub>&#x2605;</sub></strong> (M<sub>Ks</sub>+[Fe/H]) [R<sub>&#x2609;</sub>]<sup title='Mann et al. (2015) Table 1 row 2'>c2</sup>",
+      "mass_msun": "<strong>M<sub>&#x2605;</sub></strong> (Mann+15, M<sub>Ks</sub>) [M<sub>&#x2609;</sub>]<sup title='Mann et al. (2015) Table 1 row 5'>d</sup>",
+      "mass_del_msun": "<strong>M<sub>&#x2605;</sub></strong> (Delfosse+00, M<sub>K</sub>) [M<sub>&#x2609;</sub>]<sup title='Delfosse et al. (2000)'>f</sup>",
       "logg_cgs": "<strong>log g</strong> [cgs]<sup title='from R and M'>e</sup>",
+      "lum_lsun": "<strong>L<sub>&#x2605;</sub></strong> [L<sub>&#x2609;</sub>]<sup title='from R and Teff'>h</sup>",
+      "gaia_pmra_masyr": "<strong>&mu;<sub>&alpha;*</sub></strong> [mas/yr]",
+      "gaia_pmdec_masyr": "<strong>&mu;<sub>&delta;</sub></strong> [mas/yr]",
+      "rv_kms": "<strong>RV</strong> [km/s]",
+      "vsky_kms": "<strong>v<sub>sky</sub></strong> [km/s]<sup title='sky-plane velocity from Gaia proper motion and parallax'>g</sup>",
+      "v3d_kms": "<strong>v<sub>3D</sub></strong> [km/s]<sup title='3D space velocity (v_sky + RV)'>g2</sup>",
+      "U_kms": "<strong>U</strong> [km/s]<sup title='galactic velocity toward GC'>i</sup>",
+      "V_kms": "<strong>V</strong> [km/s]<sup title='galactic velocity in direction of rotation'>i</sup>",
+      "W_kms": "<strong>W</strong> [km/s]<sup title='galactic velocity toward NGP'>i</sup>",
     }
+    ra_deg = parse_float(data.get("ra_deg"))
+    dec_deg = parse_float(data.get("dec_deg"))
+    rv_kms = parse_float(data.get("rv_kms"))
+    gal_lon_deg, gal_lat_deg = compute_galactic_longitude_latitude(ra_deg, dec_deg)
+    ecl_lon_deg, ecl_lat_deg, telluric_summary = summarize_problematic_rv_windows(ra_deg, dec_deg, rv_kms)
     teff_sigma = data.get("_teff_sigma")
-    if teff_sigma == 150:
-      fn_a = (
-        "<sup>a</sup> Pecaut &amp; Mamajek (2013) quadratic + Filippazzo et al. (2015) "
-        "linear extension for M7&#8211;L0 (G<sub>BP</sub>&#8722;G<sub>RP</sub> &gt; 4.0); "
-        "&sigma; &#8776; 150&nbsp;K."
-      )
-    else:
-      fn_a = (
-        "<sup>a</sup> Pecaut &amp; Mamajek (2013), ApJS&nbsp;208,&nbsp;9: "
-        "G<sub>BP</sub>&#8722;G<sub>RP</sub> &#8594; T<sub>eff</sub> quadratic sequence; &sigma; &#8776; 100&nbsp;K."
-      )
+    teff_color = data.get("_teff_color", "BP-RP")
+    mann2015_link = "<a href='https://doi.org/10.1088/0004-637X/804/1/64' target='_blank' rel='noopener'>Mann et al. (2015), ApJ&nbsp;804,&nbsp;64</a>"
     FOOTNOTES = (
-      fn_a + "<br>"
-      "<sup>b</sup> Duque-Arribas et al. (2021, CS20.5 conference poster): photometric [Fe/H] from "
+      f"<sup>a1</sup> {mann2015_link}, Table&nbsp;2 row&nbsp;11: "
+      "T<sub>eff</sub> polynomial in G<sub>BP</sub>&#8722;G<sub>RP</sub> + J&#8722;H; &sigma; &#8776; 49&nbsp;K.<br>"
+      f"<sup>a2</sup> {mann2015_link}, Table&nbsp;2 row&nbsp;1: "
+      "T<sub>eff</sub> polynomial in G<sub>BP</sub>&#8722;G<sub>RP</sub> only; &sigma; &#8776; 52&nbsp;K.<br>"
+      "<sup>b</sup> <a href='https://doi.org/10.3847/1538-4357/acacf6' target='_blank' rel='noopener'>Duque-Arribas et al. (2023), ApJ&nbsp;944,&nbsp;88</a>: photometric [Fe/H] from "
       "G<sub>BP</sub>&#8722;G<sub>RP</sub>, W1&#8722;W2, and M<sub>Ks</sub>; &sigma; &#8776; 0.10 dex.<br>"
-      "<sup>c</sup> Mann et al. (2015), ApJ&nbsp;804,&nbsp;64, Table&nbsp;1: radius polynomial in M<sub>Ks</sub>; &sigma; &#8776; 3%.<br>"
-      "<sup>d</sup> Mann et al. (2015), Table&nbsp;1: mass-luminosity polynomial in M<sub>Ks</sub>; &sigma; &#8776; 2%.<br>"
-      "<sup>e</sup> log&nbsp;g = log&nbsp;g<sub>&#x2609;</sub> + log(M/M<sub>&#x2609;</sub>) &#8722; 2&nbsp;log(R/R<sub>&#x2609;</sub>)."
+      f"<sup>c1</sup> {mann2015_link}, Table&nbsp;1 row&nbsp;1: radius polynomial in M<sub>Ks</sub>; &sigma; &#8776; 2.89%.<br>"
+      f"<sup>c2</sup> {mann2015_link}, Table&nbsp;1 row&nbsp;2: radius polynomial in M<sub>Ks</sub> + [Fe/H]; &sigma; &#8776; 2.70%.<br>"
+      f"<sup>d</sup> {mann2015_link}, Table&nbsp;1: mass-luminosity polynomial in M<sub>Ks</sub>; &sigma; &#8776; 2%.<br>"
+      "<sup>e</sup> log&nbsp;g = log&nbsp;g<sub>&#x2609;</sub> + log(M/M<sub>&#x2609;</sub>) &#8722; 2&nbsp;log(R/R<sub>&#x2609;</sub>).<br>"
+      "<sup>f</sup> <a href='https://doi.org/10.1051/0004-6361:20001166' target='_blank' rel='noopener'>Delfosse et al. (2000), A&amp;A&nbsp;364,&nbsp;217</a>: "
+      "log(M/M<sub>&#x2609;</sub>) = 10<sup>&#8722;3</sup>(1.8 + 6.12&middot;M<sub>K</sub> + 13.205&middot;M<sub>K</sub><sup>2</sup> &#8722; 6.2315&middot;M<sub>K</sub><sup>3</sup> + 0.37529&middot;M<sub>K</sub><sup>4</sup>); valid M<sub>K</sub>&isin;[4.5,&nbsp;9.5].<br>"
+      "<sup>g</sup> v<sub>sky</sub> = 4.74047 &times; d<sub>pc</sub> &times; &mu;<sub>tot</sub>&nbsp;[mas/yr] km/s; &mu;<sub>tot</sub> = (&mu;<sub>&alpha;*</sub><sup>2</sup> + &mu;<sub>&delta;</sub><sup>2</sup>)<sup>1/2</sup> from Gaia DR3.<br>"
+      "<sup>g2</sup> v<sub>3D</sub> = (v<sub>sky</sub><sup>2</sup> + RV<sup>2</sup>)<sup>1/2</sup>; RV from SIMBAD.<br>"
+      "<sup>i</sup> Galactic UVW from Johnson &amp; Soderblom (1987, AJ&nbsp;93,&nbsp;864); U toward GC, V in direction of galactic rotation, W toward NGP. Requires RV.<br>"
+      "<sup>j</sup> Telluric-overlap windows use only the orbital barycentric term projected along the line of sight, sampled once per day over a non-leap year. Earth rotation is intentionally ignored (typically &lt;0.4 km/s effect).<br>"
+      "<sup>h</sup> L/L<sub>&#x2609;</sub> = (R/R<sub>&#x2609;</sub>)<sup>2</sup> (T<sub>eff</sub>/T<sub>&#x2609;</sub>)<sup>4</sup>, T<sub>&#x2609;</sub> = 5778&nbsp;K; uses BP&#8722;RP+J&#8722;H T<sub>eff</sub> when available."
     )
-    rows_html = []
-    for k, v in data.items():
-      if k in hidden_keys:
-        continue
+    ROW_GROUPS = {
+      "teff_jh_K": "grp-teff", "teff_K": "grp-teff",
+      "radius_rsun": "grp-rad",  "radius_feh_rsun": "grp-rad",
+      "mass_msun": "grp-mass",   "mass_del_msun": "grp-mass",
+      "W1_mag": "grp-wise", "W2_mag": "grp-wise",
+      "W3_mag": "grp-wise", "W4_mag": "grp-wise",
+      "gaia_pmra_masyr": "grp-kin", "gaia_pmdec_masyr": "grp-kin", "rv_kms": "grp-kin",
+      "vsky_kms": "grp-kin", "v3d_kms": "grp-kin",
+      "U_kms": "grp-uvw", "V_kms": "grp-uvw", "W_kms": "grp-uvw",
+    }
+    display_order = [
+      "main_id",
+      "sp_type",
+      "ra_deg",
+      "dec_deg",
+      "parallax_mas",
+      "gaia_pmra_masyr",
+      "gaia_pmdec_masyr",
+      "rv_kms",
+      "vsky_kms",
+      "v3d_kms",
+      "U_kms",
+      "V_kms",
+      "W_kms",
+      "G_mag",
+      "M_G_mag",
+      "GBP_mag",
+      "GRP_mag",
+      "J_mag",
+      "H_mag",
+      "K_mag",
+      "M_Ks_mag",
+      "W1_mag",
+      "W2_mag",
+      "W3_mag",
+      "W4_mag",
+      "teff_jh_K",
+      "teff_K",
+      "feh_duque_dex",
+      "radius_rsun",
+      "radius_feh_rsun",
+      "mass_msun",
+      "mass_del_msun",
+      "logg_cgs",
+      "lum_lsun",
+    ]
+
+    def build_row_html(k):
+      v = data.get(k)
       label = labels.get(k, k)
+      grp_class = ROW_GROUPS.get(k, "")
+      row_cls = f' class="{grp_class}"' if grp_class else ""
       if k in EDITABLE_KEYS and (v is None or k in EDITING_KEYS):
         current_value = "" if v is None else v
         cell = (
@@ -1108,12 +1465,64 @@
         )
         action_cell = ""
       else:
-        cell = "" if v is None else f'<span class="value-wrap">{v}</span>'
+        if k == "main_id":
+          simbad_url = build_simbad_object_url(v)
+          escaped_name = "" if v is None else html.escape(str(v))
+          if simbad_url is None or not escaped_name:
+            cell = "" if v is None else f'<span class="value-wrap">{escaped_name}</span>'
+          else:
+            cell = f'<span class="value-wrap"><a href="{simbad_url}" target="_blank" rel="noopener">{escaped_name}</a></span>'
+        elif k == "ra_deg":
+          ra_text = format_ra_sexagesimal(parse_float(v))
+          raw_deg = "" if v is None else html.escape(str(v))
+          cell = "" if ra_text is None else f'<span class="value-wrap" title="{raw_deg} deg">{ra_text}</span>'
+        elif k == "dec_deg":
+          dec_text = format_dec_sexagesimal(parse_float(v))
+          raw_deg = "" if v is None else html.escape(str(v))
+          cell = "" if dec_text is None else f'<span class="value-wrap" title="{raw_deg} deg">{dec_text}</span>'
+        else:
+          cell = "" if v is None else f'<span class="value-wrap">{v}</span>'
         if k in EDITABLE_KEYS:
           action_cell = f'<button class="edit-btn" data-key="{k}">Edit</button>'
         else:
           action_cell = ""
-      rows_html.append(f'<tr><th>{label}</th><td>{cell}</td><td class="actions">{action_cell}</td></tr>')
+      row_html = f'<tr{row_cls}><th>{label}</th><td>{cell}</td><td class="actions">{action_cell}</td></tr>'
+      if k == "dec_deg":
+        extra_rows = []
+        if gal_lon_deg is not None:
+          extra_rows.append(
+            f'<tr><th>Galactic longitude <strong>l</strong> [deg]</th><td><span class="value-wrap">{gal_lon_deg:.4f}</span></td><td class="actions"></td></tr>'
+          )
+        if gal_lat_deg is not None:
+          extra_rows.append(
+            f'<tr><th>Galactic latitude <strong>b</strong> [deg]</th><td><span class="value-wrap">{gal_lat_deg:+.4f}</span></td><td class="actions"></td></tr>'
+          )
+        if ecl_lon_deg is not None:
+          extra_rows.append(
+            f'<tr><th>Ecliptic longitude <strong>&lambda;</strong> [deg]</th><td><span class="value-wrap">{ecl_lon_deg:.4f}</span></td><td class="actions"></td></tr>'
+          )
+        if ecl_lat_deg is not None:
+          extra_rows.append(
+            f'<tr><th>Ecliptic latitude <strong>&beta;</strong> [deg]</th><td><span class="value-wrap">{ecl_lat_deg:+.4f}</span></td><td class="actions"></td></tr>'
+          )
+        if telluric_summary is not None:
+          extra_rows.append(
+            f'<tr class="grp-kin"><th>Telluric overlap risk<sup title="Orbital barycentric component only; daily sampling over a non-leap year.">j</sup></th><td>{telluric_summary}</td><td class="actions"></td></tr>'
+          )
+        row_html += "".join(extra_rows)
+      return row_html
+
+    rows_html = []
+    seen_keys = set()
+    for k in display_order:
+      if k in hidden_keys or k not in data:
+        continue
+      rows_html.append(build_row_html(k))
+      seen_keys.add(k)
+    for k in data:
+      if k in hidden_keys or k in seen_keys:
+        continue
+      rows_html.append(build_row_html(k))
 
     rows = "".join(rows_html)
     refs_html = data.get("refs_html") or ""
@@ -1373,9 +1782,11 @@
         cached = None
 
     if cached is not None:
+      recompute_derived_fields(cached)
       EDITING_KEYS.clear()
       set_refresh_button_visible(True)
       LAST_RESULT = cached.copy()
+      save_cached_result(target, cached)
       render_table(cached)
       missing_cached = [k for k in PHOT_KEYS if cached.get(k) is None]
       render_manual_fields(missing_cached, cached)
@@ -1403,6 +1814,7 @@
       b.plx_value AS parallax_mas,
       b.sp_type AS sp_type,
       b.otype_txt AS otype_txt,
+      b.rvz_radvel AS rv_kms,
       f.G AS G_mag,
       f.J AS J_mag,
       f.H AS H_mag,
@@ -1429,6 +1841,7 @@
         "parallax_mas",
         "sp_type",
         "otype_txt",
+        "rv_kms",
         "G_mag",
         "J_mag",
         "H_mag",
