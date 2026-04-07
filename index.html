@@ -441,7 +441,7 @@
   import asyncio
   import json
   import html
-  from urllib.parse import quote_plus
+  from urllib.parse import parse_qs, quote_plus, unquote_plus
 
   from js import document, window
   from pyodide.http import pyfetch
@@ -481,9 +481,13 @@
     "GRP_mag",
     "W1_mag",
     "W2_mag",
+    "gaia_pmra_masyr",
+    "gaia_pmdec_masyr",
+    "rv_kms",
   ]
   EDITING_KEYS = set()
   DYNAMIC_PROXIES = []
+  URL_EVENT_PROXIES = []
   OBLIQUITY_DEG = 23.4392911
   EARTH_ORBITAL_SPEED_KMS = 29.79
   PROBLEMATIC_RV_THRESHOLD_KMS = 5.0
@@ -558,6 +562,10 @@
     DYNAMIC_PROXIES = []
 
 
+  def register_url_proxy(proxy):
+    URL_EVENT_PROXIES.append(proxy)
+
+
   def attach_table_handlers():
     reset_dynamic_proxies()
 
@@ -611,6 +619,51 @@
     if sval is None:
       return None
     return f"https://simbad.cds.unistra.fr/simbad/sim-id?Ident={quote_plus(sval)}"
+
+
+  def extract_target_from_url():
+    hash_value = normalize_value(window.location.hash)
+    if hash_value:
+      raw_hash = hash_value[1:] if hash_value.startswith("#") else hash_value
+      parsed_hash = parse_qs(raw_hash, keep_blank_values=False)
+      for key in ("target", "name", "id", "q"):
+        values = parsed_hash.get(key)
+        if values:
+          target = normalize_value(values[0])
+          if target is not None:
+            return target
+      target = normalize_value(unquote_plus(raw_hash))
+      if target is not None:
+        return target
+
+    search_value = normalize_value(window.location.search)
+    if search_value:
+      raw_query = search_value[1:] if search_value.startswith("?") else search_value
+      parsed_query = parse_qs(raw_query, keep_blank_values=False)
+      for key in ("target", "name", "id", "q"):
+        values = parsed_query.get(key)
+        if values:
+          target = normalize_value(values[0])
+          if target is not None:
+            return target
+    return None
+
+
+  async def run_lookup_from_url(force=False):
+    target = extract_target_from_url()
+    if target is None:
+      return
+
+    target_input = document.getElementById("target_name")
+    if target_input is None:
+      return
+
+    current_value = normalize_value(target_input.value)
+    if not force and current_value == target:
+      return
+
+    target_input.value = target
+    await run_lookup()
 
 
   def format_ra_sexagesimal(ra_deg):
@@ -1302,6 +1355,9 @@
     if key in PHOT_KEYS:
       feh_note, stellar_note = recompute_derived_fields(updated)
       status_msg = "Value applied. " + feh_note + " " + stellar_note
+    elif key in {"gaia_pmra_masyr", "gaia_pmdec_masyr", "rv_kms"}:
+      recompute_kinematic_fields(updated)
+      status_msg = "Kinematic value applied. Derived velocities updated."
     else:
       status_msg = "Value applied."
 
@@ -2062,7 +2118,15 @@
     # Not cached — fetch quietly in the background
     await fetch_hr_background_sample()
 
+  def _on_hash_change(event=None):
+    asyncio.ensure_future(run_lookup_from_url(force=True))
+
+  hash_proxy = create_proxy(_on_hash_change)
+  window.addEventListener("hashchange", hash_proxy)
+  register_url_proxy(hash_proxy)
+
   asyncio.ensure_future(_preload_hr())
+  asyncio.ensure_future(run_lookup_from_url())
     </script>
 </body>
 </html>
