@@ -131,9 +131,32 @@
 
     .topbar {
       display: flex;
-      justify-content: flex-end;
+      justify-content: space-between;
+      align-items: center;
       margin-bottom: 0.9rem;
     }
+
+    .home-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: var(--ink-dim);
+      text-decoration: none;
+      padding: 0.38rem 0.85rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #241216d9;
+      backdrop-filter: blur(6px);
+      transition: color 0.2s, background 0.2s;
+    }
+
+    .home-link:hover { color: var(--accent); }
+
+    html[lang="en"] .home-link-fr { display: none; }
+    html[lang="fr"] .home-link-en { display: none; }
 
     .lang-toggle {
       display: inline-flex;
@@ -457,6 +480,8 @@
   <div class="star-bg sb10"></div>
   <div class="wrap">
     <div class="topbar">
+      <a href="https://eartigau.github.io/index_en.html" class="home-link home-link-en">← Home</a>
+      <a href="https://eartigau.github.io/index_fr.html" class="home-link home-link-fr">← Accueil</a>
       <div class="lang-toggle" aria-label="Language selector">
         <button id="lang_en_btn" type="button" data-lang="en">EN</button>
         <button id="lang_fr_btn" type="button" data-lang="fr">FR</button>
