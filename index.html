@@ -803,13 +803,33 @@
   from pyodide.http import pyfetch
   from pyodide.ffi import create_proxy
 
-  SIMBAD_TAP = "https://simbad.cds.unistra.fr/simbad/sim-tap/sync"
+  # SIMBAD's TAP service at the CDS, then its mirrors at the CfA and at IDIA:
+  #   the first that answers is asked first afterwards (2026-11-11: the CDS
+  #   was offline after a cybersecurity incident, the mirrors answered)
+  SIMBAD_TAPS = [
+    "https://simbad.cds.unistra.fr/simbad/sim-tap/sync",
+    "https://simbad.cfa.harvard.edu/simbad/sim-tap/sync",
+    "https://simbad.idia.ac.za/simbad/sim-tap/sync",
+  ]
   GAIA_TAP = "https://gea.esac.esa.int/tap-server/tap/sync"
   VIZIER_TAP = "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync"
+  # GAVO's TAP service (Heidelberg) answers browsers (CORS) with Gaia DR3
+  #   (gaia.dr3lite) and AllWISE (wise.main): asked when VizieR does not answer
+  GAVO_TAP = "https://dc.g-vo.org/tap/sync"
+  # VizieR, then GAVO; the one that answered last first
+  TAP_ORDER = [VIZIER_TAP, GAVO_TAP]
+  # seconds one server may take before the next is asked
+  MIRROR_TIMEOUT_S = 6
   CACHE_PREFIX = "starometer_cache_v1_"
   HR_CACHE_KEY = "mdwarf_hr_sample_v1"
   CACHE_MAX_AGE_SEC = 7 * 24 * 3600
-  DUQUE_FEH_SIGMA_DEX = 0.10
+  # Duque-Arribas et al. (2023, ApJ 944, 88): Eq. 4, Table 4 first row
+  #   (a, b, c, d, e, f for X = W1-W2, Y = BP-RP, Z = M_G), the residual
+  #   scatter of Table 5, and the ranges of their calibration sample
+  DUQUE_FEH_COEFFS = (5.87, -1.40, 5.08, -2.45, -0.788, 0.1094)
+  DUQUE_FEH_SIGMA_DEX = 0.089
+  DUQUE_W1W2_MIN, DUQUE_W1W2_MAX = -0.10, 0.24
+  DUQUE_GJ_MIN, DUQUE_GJ_MAX = 1.85, 3.10
   MANN_RADIUS_FRAC_SIGMA = 0.03
   MANN_MASS_FRAC_SIGMA = 0.02
   TEFF_COLOR_SIGMA_K = 52
@@ -1203,8 +1223,11 @@
     flagged_days = []
     for day_index in range(365):
       sun_lon_deg = ((day_index + 1) - 80.0) * 360.0 / 365.0
+      # v_orb is the barycentric correction (BERV, positive when the Earth
+      #   moves toward the star, as astropy's radial_velocity_correction);
+      #   the star's lines sit at RV - BERV as seen from Earth
       v_orb = EARTH_ORBITAL_SPEED_KMS * math.cos(math.radians(ecl_lat_deg)) * math.sin(math.radians(sun_lon_deg - ecl_lon_deg))
-      v_total = rv_kms + v_orb
+      v_total = rv_kms - v_orb
       daily_values.append(v_total)
       flagged_days.append(abs(v_total) < PROBLEMATIC_RV_THRESHOLD_KMS)
 
@@ -1407,13 +1430,18 @@
 
   def compute_duque_feh(data):
     """
-    Duque-Arribas et al. (2021, CS20.5 poster) photometric metallicity relation:
-    [Fe/H] = ( (G_BP - G_RP) - 0.596 - 2.336*X - 0.498*X^2 - 0.254*M_Ks ) / (0.618 + 0.960*X)
-    with X = (W1 - W2).
+    Duque-Arribas et al. (2023, ApJ 944, 88), Eq. 4 with the first row of
+    their Table 4 (their most accurate calibration):
+    [Fe/H] = a + b*X + c*Y + d*Z + e*Y^2 + f*Z^2,
+    X = W1 - W2, Y = G_BP - G_RP, Z = M_G; residual scatter 0.089 dex
+    (Table 5). Calibrated on M0V-M5V dwarfs with -0.10 <= W1 - W2 <= 0.24
+    and 1.85 <= G - J <= 3.10: outside these, no [Fe/H] (a bright star's
+    saturated W1 gives W1 - W2 far outside).
     """
     m_ks, mk_note = compute_absolute_k(data)
-    if m_ks is None:
-      return None, None, None, mk_note
+    m_g = compute_absolute_g(data)
+    if m_g is None:
+      return None, None, m_ks, "Missing parallax or <strong>G</strong> for Duque <strong>[Fe/H]</strong>."
 
     gbp_mag = parse_float(data.get("GBP_mag"))
     grp_mag = parse_float(data.get("GRP_mag"))
@@ -1424,13 +1452,17 @@
       return None, None, m_ks, "Missing <strong>G<sub>BP</sub></strong>, <strong>G<sub>RP</sub></strong>, <strong>W1</strong>, or <strong>W2</strong> for Duque <strong>[Fe/H]</strong>."
 
     x = w1_mag - w2_mag
-    denom = 0.618 + 0.960 * x
-    if abs(denom) < 1e-9:
-      return None, None, m_ks, "Duque [Fe/H] denominator is too close to zero."
+    if not (DUQUE_W1W2_MIN <= x <= DUQUE_W1W2_MAX):
+      return None, None, m_ks, f"&#9888; W1&#8722;W2 = {x:.2f} is outside the Duque-Arribas et al. (2023) calibration ({DUQUE_W1W2_MIN:.2f} to {DUQUE_W1W2_MAX:.2f}; a saturated W1 for a bright star): no photometric [Fe/H]."
+    g_mag = parse_float(data.get("G_mag"))
+    j_mag = parse_float(data.get("J_mag"))
+    if g_mag is not None and j_mag is not None and not (DUQUE_GJ_MIN <= g_mag - j_mag <= DUQUE_GJ_MAX):
+      return None, None, m_ks, f"&#9888; G&#8722;J = {g_mag - j_mag:.2f} is outside the Duque-Arribas et al. (2023) calibration ({DUQUE_GJ_MIN:.2f} to {DUQUE_GJ_MAX:.2f}): no photometric [Fe/H]."
 
-    g_bp_minus_g_rp = gbp_mag - grp_mag
-    feh = (g_bp_minus_g_rp - 0.596 - 2.336 * x - 0.498 * (x ** 2) - 0.254 * m_ks) / denom
-    return feh, DUQUE_FEH_SIGMA_DEX, m_ks, "Photometric [Fe/H] from Duque-Arribas et al. (2021), with 0.10 dex reliability."
+    y = gbp_mag - grp_mag
+    a, b, c, d, e, f = DUQUE_FEH_COEFFS
+    feh = a + b * x + c * y + d * m_g + e * y ** 2 + f * m_g ** 2
+    return feh, DUQUE_FEH_SIGMA_DEX, m_ks, "Photometric [Fe/H] from Duque-Arribas et al. (2023), Eq. 4 (0.09 dex scatter)."
 
 
   def compute_radius_mass_logg(data):
@@ -1456,7 +1488,9 @@
     feh_str = data.get("feh_duque_dex")
     feh_val = parse_float(feh_str.split("\u00b1")[0].strip()) if feh_str else None
     if feh_val is not None:
-      r_star_feh = 1.9305 - 0.3466 * m_ks + 0.01647 * (m_ks ** 2) + 0.04458 * feh_val
+      # Mann+15 (erratum, ApJ 819, 87), Table 1 notes: "for the equations
+      #   including [Fe/H] the right-hand side is multiplied by (1 + f[Fe/H])"
+      r_star_feh = (1.9305 - 0.3466 * m_ks + 0.01647 * (m_ks ** 2)) * (1.0 + 0.04458 * feh_val)
       sigma_r_feh = 0.0270 * r_star_feh
     else:
       r_star_feh = None
@@ -1538,17 +1572,28 @@
 
 
   async def tap_query(adql, timeout_s=20):
+    """SIMBAD, at the first of SIMBAD_TAPS that answers (moved first)."""
     params = (
       "request=doQuery"
       "&lang=adql"
       "&format=json"
       f"&query={quote_plus(adql)}"
     )
-    url = f"{SIMBAD_TAP}?{params}"
-    response = await asyncio.wait_for(pyfetch(url, method="GET"), timeout=timeout_s)
-    if not response.ok:
-      raise RuntimeError(f"SIMBAD TAP HTTP error: {response.status}")
-    return await asyncio.wait_for(response.json(), timeout=timeout_s)
+    failures = []
+    for base in list(SIMBAD_TAPS):
+      try:
+        response = await asyncio.wait_for(pyfetch(f"{base}?{params}", method="GET"), timeout=min(timeout_s, MIRROR_TIMEOUT_S))
+        if not response.ok:
+          failures.append(f"{base.split('/')[2]}: HTTP {response.status}")
+          continue
+        payload = await asyncio.wait_for(response.json(), timeout=timeout_s)
+      except Exception as exc:
+        failures.append(f"{base.split('/')[2]}: {type(exc).__name__}")
+        continue
+      SIMBAD_TAPS.remove(base)
+      SIMBAD_TAPS.insert(0, base)
+      return payload
+    raise RuntimeError("SIMBAD could not be reached (" + "; ".join(failures) + ")")
 
 
   async def gaia_csv_query(adql, timeout_s=15):
@@ -1565,18 +1610,33 @@
     return await asyncio.wait_for(response.text(), timeout=timeout_s)
 
 
-  async def vizier_json_query(adql, timeout_s=15):
-    params = (
-      "request=doQuery"
-      "&lang=adql"
-      "&format=json"
-      f"&query={quote_plus(adql)}"
-    )
-    url = f"{VIZIER_TAP}?{params}"
-    response = await asyncio.wait_for(pyfetch(url, method="GET"), timeout=timeout_s)
-    if not response.ok:
-      return None
-    return await asyncio.wait_for(response.json(), timeout=timeout_s)
+  async def vizier_json_query(adql, timeout_s=15, gavo_adql=None):
+    """VizieR's TAP service, or GAVO's with gavo_adql (the same columns, in
+    the same order, from GAVO's copy of the catalog): the one that answered
+    last is asked first. GAVO wants the parameters' values in capitals."""
+    queries = {VIZIER_TAP: adql, GAVO_TAP: gavo_adql}
+    for base in list(TAP_ORDER):
+      query = queries[base]
+      if not query:
+        continue
+      params = (
+        "REQUEST=doQuery"
+        "&LANG=ADQL"
+        "&FORMAT=json"
+        f"&QUERY={quote_plus(query)}"
+      )
+      try:
+        response = await asyncio.wait_for(pyfetch(f"{base}?{params}", method="GET"), timeout=min(timeout_s, MIRROR_TIMEOUT_S))
+        if not response.ok:
+          continue
+        payload = await asyncio.wait_for(response.json(), timeout=timeout_s)
+      except Exception:
+        continue
+      if isinstance(payload, dict) and payload.get("data") is not None:
+        TAP_ORDER.remove(base)
+        TAP_ORDER.insert(0, base)
+        return payload
+    return None
 
 
   async def run_with_timeout(coro, timeout_s):
@@ -1612,12 +1672,12 @@
   async def fetch_simbad_refs(safe_target, limit=10):
     """Return a list of ADS bibcodes for this target, most recent first."""
     adql = f"""
-    SELECT TOP {limit} r.bibcode
+    SELECT TOP {limit} r.bibcode, r."year"
     FROM ref r
     JOIN has_ref h ON h.oidbibref = r.oidbib
     JOIN ident i ON h.oidref = i.oidref
     WHERE i.id = '{safe_target}'
-    ORDER BY r.year DESC
+    ORDER BY "year" DESC
     """
     payload = await tap_query(adql)
     return [normalize_value(row[0]) for row in payload.get("data", []) if row and row[0]]
@@ -1712,7 +1772,12 @@
       CIRCLE('ICRS', {ra_deg}, {dec_deg}, 0.0005)
     )
     """
-    payload = await vizier_json_query(adql)
+    gavo_adql = f"""
+    SELECT TOP 20 source_id, ra, dec, pmra, pmdec
+    FROM gaia.dr3lite
+    WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra_deg}, {dec_deg}, 0.0005))
+    """
+    payload = await vizier_json_query(adql, gavo_adql=gavo_adql)
     if payload is None:
       return None, None, None, None, None, None
 
@@ -1756,7 +1821,16 @@
     FROM {table}
     WHERE Source = {gaia_source_id}
     """
-    payload = await vizier_json_query(adql)
+    # GAVO holds DR3 (whose source_id are those of EDR3), its magnitude
+    #   errors as 2.5/ln(10) over the flux's signal-to-noise
+    gavo_adql = None if gaia_release not in ("dr3", "edr3") else f"""
+    SELECT TOP 1 phot_bp_mean_mag, phot_rp_mean_mag,
+      1.0857362 / phot_bp_mean_flux_over_error, 1.0857362 / phot_rp_mean_flux_over_error,
+      ra, dec, pmra, pmdec
+    FROM gaia.dr3lite
+    WHERE source_id = {gaia_source_id}
+    """
+    payload = await vizier_json_query(adql, gavo_adql=gavo_adql)
     if payload is None:
       return None, None, None, None, None, None, None, None, None
 
@@ -1791,7 +1865,13 @@
       CIRCLE('ICRS', {ra_deg}, {dec_deg}, 0.0005)
     )
     """
-    payload = await vizier_json_query(adql)
+    gavo_adql = f"""
+    SELECT TOP 20 ra, dec, phot_bp_mean_mag, phot_rp_mean_mag,
+      1.0857362 / phot_bp_mean_flux_over_error, 1.0857362 / phot_rp_mean_flux_over_error
+    FROM gaia.dr3lite
+    WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra_deg}, {dec_deg}, 0.0005))
+    """
+    payload = await vizier_json_query(adql, gavo_adql=gavo_adql)
     if payload is None:
       return None, None, None, None
 
@@ -1862,7 +1942,12 @@
       CIRCLE('ICRS', {ra_deg}, {dec_deg}, {radius_arcsec}/3600.0)
     )
     """
-    payload = await vizier_json_query(adql)
+    gavo_adql = f"""
+    SELECT TOP 20 raj2000, dej2000, w1mpro, w1sigmrpo, w2mpro, w2sigmrpo, w3mpro, w3sigmrpo, w4mpro, w4sigmrpo
+    FROM wise.main
+    WHERE 1 = CONTAINS(POINT('ICRS', raj2000, dej2000), CIRCLE('ICRS', {ra_deg}, {dec_deg}, {radius_arcsec}/3600.0))
+    """
+    payload = await vizier_json_query(adql, gavo_adql=gavo_adql)
     if payload is None:
       return None, None, None, None, None, None, None, None
 
@@ -2388,9 +2473,9 @@
     footnote_text = {
       "a1": f"<sup>a1</sup> {mann2015_link}, {'Tableau&nbsp;2 ligne&nbsp;11 : polynome de T<sub>eff</sub> en G<sub>BP</sub>&#8722;G<sub>RP</sub> + J&#8722;H ; &sigma; &#8776; 49&nbsp;K.' if is_fr else 'Table&nbsp;2 row&nbsp;11: T<sub>eff</sub> polynomial in G<sub>BP</sub>&#8722;G<sub>RP</sub> + J&#8722;H; &sigma; &#8776; 49&nbsp;K.'}",
       "a2": f"<sup>a2</sup> {mann2015_link}, {'Tableau&nbsp;2 ligne&nbsp;1 : polynome de T<sub>eff</sub> en G<sub>BP</sub>&#8722;G<sub>RP</sub> seulement ; &sigma; &#8776; 52&nbsp;K.' if is_fr else 'Table&nbsp;2 row&nbsp;1: T<sub>eff</sub> polynomial in G<sub>BP</sub>&#8722;G<sub>RP</sub> only; &sigma; &#8776; 52&nbsp;K.'}",
-      "b": "<sup>b</sup> <a href='https://doi.org/10.3847/1538-4357/acacf6' target='_blank' rel='noopener'>Duque-Arribas et al. (2023), ApJ&nbsp;944,&nbsp;88</a>: " + ("[Fe/H] photometrique a partir de G<sub>BP</sub>&#8722;G<sub>RP</sub>, W1&#8722;W2 et M<sub>Ks</sub> ; &sigma; &#8776; 0.10 dex." if is_fr else "photometric [Fe/H] from G<sub>BP</sub>&#8722;G<sub>RP</sub>, W1&#8722;W2, and M<sub>Ks</sub>; &sigma; &#8776; 0.10 dex."),
+      "b": "<sup>b</sup> <a href='https://doi.org/10.3847/1538-4357/acacf6' target='_blank' rel='noopener'>Duque-Arribas et al. (2023), ApJ&nbsp;944,&nbsp;88</a>: " + ("[Fe/H] photometrique a partir de W1&#8722;W2, G<sub>BP</sub>&#8722;G<sub>RP</sub> et M<sub>G</sub> (Eq.&nbsp;4, Tableau&nbsp;4) ; &sigma; &#8776; 0.09 dex ; calibree sur M0V&#8211;M5V, &#8722;0.10&nbsp;&le;&nbsp;W1&#8722;W2&nbsp;&le;&nbsp;0.24, 1.85&nbsp;&le;&nbsp;G&#8722;J&nbsp;&le;&nbsp;3.10." if is_fr else "photometric [Fe/H] from W1&#8722;W2, G<sub>BP</sub>&#8722;G<sub>RP</sub>, and M<sub>G</sub> (Eq.&nbsp;4, Table&nbsp;4); &sigma; &#8776; 0.09 dex; calibrated on M0V&#8211;M5V, &#8722;0.10&nbsp;&le;&nbsp;W1&#8722;W2&nbsp;&le;&nbsp;0.24, 1.85&nbsp;&le;&nbsp;G&#8722;J&nbsp;&le;&nbsp;3.10."),
       "c1": f"<sup>c1</sup> {mann2015_link}, {'Tableau&nbsp;1 ligne&nbsp;1 : polynome de rayon en M<sub>Ks</sub> ; &sigma; &#8776; 2.89%.' if is_fr else 'Table&nbsp;1 row&nbsp;1: radius polynomial in M<sub>Ks</sub>; &sigma; &#8776; 2.89%.'}",
-      "c2": f"<sup>c2</sup> {mann2015_link}, {'Tableau&nbsp;1 ligne&nbsp;2 : polynome de rayon en M<sub>Ks</sub> + [Fe/H] ; &sigma; &#8776; 2.70%.' if is_fr else 'Table&nbsp;1 row&nbsp;2: radius polynomial in M<sub>Ks</sub> + [Fe/H]; &sigma; &#8776; 2.70%.'}",
+      "c2": f"<sup>c2</sup> {mann2015_link}, {'Tableau&nbsp;1 ligne&nbsp;2 : polynome de rayon en M<sub>Ks</sub>, multiplie par (1 + 0.04458&nbsp;[Fe/H]) ; &sigma; &#8776; 2.70%.' if is_fr else 'Table&nbsp;1 row&nbsp;2: radius polynomial in M<sub>Ks</sub>, multiplied by (1 + 0.04458&nbsp;[Fe/H]); &sigma; &#8776; 2.70%.'}",
       "d": f"<sup>d</sup> {mann2015_link}, {'Tableau&nbsp;1 : polynome masse-luminosite en M<sub>Ks</sub> ; &sigma; &#8776; 2%.' if is_fr else 'Table&nbsp;1: mass-luminosity polynomial in M<sub>Ks</sub>; &sigma; &#8776; 2%.'}",
       "e": "<sup>e</sup> " + ("log&nbsp;g = log&nbsp;g<sub>&#x2609;</sub> + log(M/M<sub>&#x2609;</sub>) &#8722; 2&nbsp;log(R/R<sub>&#x2609;</sub>)."),
       "f": "<sup>f</sup> <a href='https://doi.org/10.1051/0004-6361:20001166' target='_blank' rel='noopener'>Delfosse et al. (2000), A&amp;A&nbsp;364,&nbsp;217</a>: " + ("log(M/M<sub>&#x2609;</sub>) = 10<sup>&#8722;3</sup>(1.8 + 6.12&middot;M<sub>K</sub> + 13.205&middot;M<sub>K</sub><sup>2</sup> &#8722; 6.2315&middot;M<sub>K</sub><sup>3</sup> + 0.37529&middot;M<sub>K</sub><sup>4</sup>) ; valide pour M<sub>K</sub>&isin;[4.5,&nbsp;9.5]." if is_fr else "log(M/M<sub>&#x2609;</sub>) = 10<sup>&#8722;3</sup>(1.8 + 6.12&middot;M<sub>K</sub> + 13.205&middot;M<sub>K</sub><sup>2</sup> &#8722; 6.2315&middot;M<sub>K</sub><sup>3</sup> + 0.37529&middot;M<sub>K</sub><sup>4</sup>); valid M<sub>K</sub>&isin;[4.5,&nbsp;9.5]."),
@@ -2398,7 +2483,7 @@
       "g2": "<sup>g2</sup> " + ("v<sub>3D</sub> = (v<sub>sky</sub><sup>2</sup> + RV<sup>2</sup>)<sup>1/2</sup> ; RV issue de SIMBAD." if is_fr else "v<sub>3D</sub> = (v<sub>sky</sub><sup>2</sup> + RV<sup>2</sup>)<sup>1/2</sup>; RV from SIMBAD."),
       "h": "<sup>h</sup> " + ("L/L<sub>&#x2609;</sub> = (R/R<sub>&#x2609;</sub>)<sup>2</sup> (T<sub>eff</sub>/T<sub>&#x2609;</sub>)<sup>4</sup>, T<sub>&#x2609;</sub> = 5778&nbsp;K ; utilise T<sub>eff</sub> en BP&#8722;RP+J&#8722;H quand disponible." if is_fr else "L/L<sub>&#x2609;</sub> = (R/R<sub>&#x2609;</sub>)<sup>2</sup> (T<sub>eff</sub>/T<sub>&#x2609;</sub>)<sup>4</sup>, T<sub>&#x2609;</sub> = 5778&nbsp;K; uses BP&#8722;RP+J&#8722;H T<sub>eff</sub> when available."),
       "i": "<sup>i</sup> " + ("UVW galactiques d'apres Johnson &amp; Soderblom (1987, AJ&nbsp;93,&nbsp;864) ; U vers le centre galactique, V dans le sens de la rotation galactique, W vers le PNG. Necessite RV." if is_fr else "Galactic UVW from Johnson &amp; Soderblom (1987, AJ&nbsp;93,&nbsp;864); U toward GC, V in direction of galactic rotation, W toward NGP. Requires RV."),
-      "j": "<sup>j</sup> " + ("Les fenetres de recouvrement tellurique utilisent uniquement la composante barycentrique orbitale projetee sur la ligne de visee, echantillonnee une fois par jour sur une annee non bissextile. La rotation de la Terre est ignoree volontairement (effet typiquement &lt;0.4 km/s)." if is_fr else "Telluric-overlap windows use only the orbital barycentric term projected along the line of sight, sampled once per day over a non-leap year. Earth rotation is intentionally ignored (typically &lt;0.4 km/s effect)."),
+      "j": "<sup>j</sup> " + ("Les fenetres de recouvrement tellurique sont les jours ou la vitesse de l'etoile vue de la Terre, RV &#8722; BERV, est sous 5&nbsp;km/s en valeur absolue ; le BERV n'utilise que la composante barycentrique orbitale projetee sur la ligne de visee, echantillonnee une fois par jour sur une annee non bissextile. La rotation de la Terre est ignoree volontairement (effet typiquement &lt;0.4 km/s)." if is_fr else "Telluric-overlap windows are the days when the star's velocity as seen from Earth, RV &#8722; BERV, is below 5&nbsp;km/s in absolute value; the BERV uses only the orbital barycentric term projected along the line of sight, sampled once per day over a non-leap year. Earth rotation is intentionally ignored (typically &lt;0.4 km/s effect)."),
       "k": "<sup>k</sup> " + ("Pour les etoiles plus precoces de la sequence principale, le code utilise d'abord Gaia DR3 GSP-Phot/FLAME quand disponible ; sinon il se rabat sur une interpolation dans la sequence empirique de naines de Pecaut-Mamajek/Mamajek a partir de Gaia Bp-Rp et M<sub>G</sub>." if is_fr else "For earlier main-sequence stars, the code first uses Gaia DR3 GSP-Phot/FLAME when available; otherwise it falls back to interpolation within the Pecaut-Mamajek/Mamajek empirical dwarf sequence using Gaia Bp-Rp and M<sub>G</sub>."),
       "l": "<sup>l</sup> " + ("Les estimations Gaia DR3 FLAME de luminosite, rayon et masse sont privilegiees quand elles sont disponibles. Dans le cas empirique, le rayon et la masse proviennent de la sequence de naines interpolee, puis la luminosite est calculee a partir du rayon et de T<sub>eff</sub>." if is_fr else "Gaia DR3 FLAME luminosity, radius, and mass estimates are preferred when available. In the empirical fallback, radius and mass come from the interpolated dwarf sequence and luminosity is then computed from radius and T<sub>eff</sub>."),
     }
@@ -2551,7 +2636,7 @@
         if telluric_summary is not None:
           active_note_ids.add("j")
           extra_rows.append(
-            f'<tr class="grp-kin"><th>|v<sub>sys</sub> + v<sub>bary,orb</sub>| &lt; 5 km/s<sup title="{"Composante barycentrique orbitale seulement; echantillonnage quotidien sur une annee non bissextile." if is_fr else "Orbital barycentric component only; daily sampling over a non-leap year."}">j</sup></th><td>{telluric_summary}</td><td class="actions"></td></tr>'
+            f'<tr class="grp-kin"><th>|v<sub>sys</sub> &#8722; BERV| &lt; 5 km/s<sup title="{"Composante barycentrique orbitale seulement; echantillonnage quotidien sur une annee non bissextile." if is_fr else "Orbital barycentric component only; daily sampling over a non-leap year."}">j</sup></th><td>{telluric_summary}</td><td class="actions"></td></tr>'
           )
         row_html += "".join(extra_rows)
       return row_html
@@ -2765,7 +2850,15 @@
       AND RPmag IS NOT NULL
       AND Gmag IS NOT NULL
     """
-    payload = await vizier_json_query(adql, timeout_s=20)
+    gavo_adql = """
+    SELECT TOP 800 phot_bp_mean_mag, phot_rp_mean_mag, phot_g_mean_mag, parallax
+    FROM gaia.dr3lite
+    WHERE parallax > 50
+      AND phot_bp_mean_mag IS NOT NULL
+      AND phot_rp_mean_mag IS NOT NULL
+      AND phot_g_mean_mag IS NOT NULL
+    """
+    payload = await vizier_json_query(adql, timeout_s=20, gavo_adql=gavo_adql)
     if payload is None:
       return None
     rows = []
@@ -2891,7 +2984,7 @@
     # Fetch HR background sample once (cached in localStorage)
     if HR_BG_DATA is None:
       set_status(tr("Fetching &lt;20 pc HR diagram sample...", "Chargement de l'echantillon HR &lt;20 pc..."), "ok", loading=True)
-      ok_hr, _ = await run_with_timeout(fetch_hr_background_sample(), 20)
+      ok_hr, _ = await run_with_timeout(fetch_hr_background_sample(), 30)
       if not ok_hr:
         pass  # non-fatal; HR plot will just show no background
 
@@ -2999,8 +3092,8 @@
       result["refs_html"] = None
 
       # Launch identifier + bibcode fetches concurrently
-      ok_ident, ident_payload = await run_with_timeout(fetch_identifiers_for_target(safe_target), 8)
-      ok_refs, refs_payload = await run_with_timeout(fetch_simbad_refs(safe_target, limit=12), 8)
+      ok_ident, ident_payload = await run_with_timeout(fetch_identifiers_for_target(safe_target), 15)
+      ok_refs, refs_payload = await run_with_timeout(fetch_simbad_refs(safe_target, limit=12), 15)
 
       if ok_refs and refs_payload:
         links = " &nbsp;·&nbsp; ".join(
@@ -3025,7 +3118,7 @@
       if gaia_source_id is not None:
         result["gaia_source_id"] = gaia_source_id
         set_status(tr("Gaia match found. Fetching <strong>G<sub>BP</sub></strong> and <strong>G<sub>RP</sub></strong>...", "Contrepartie Gaia trouvee. Recuperation de <strong>G<sub>BP</sub></strong> et <strong>G<sub>RP</sub></strong>..."), "ok", loading=True)
-        ok_gaia, gaia_vals = await run_with_timeout(fetch_gaia_bp_rp_by_id(gaia_release, gaia_source_id), 5)
+        ok_gaia, gaia_vals = await run_with_timeout(fetch_gaia_bp_rp_by_id(gaia_release, gaia_source_id), 15)
         if ok_gaia and gaia_vals is not None:
           gbp, grp, gbp_err, grp_err, gaia_ra, gaia_dec, gaia_pmra, gaia_pmdec, gaia_ref_epoch = gaia_vals
           if gbp is not None:
@@ -3050,7 +3143,7 @@
         set_status(tr("Trying Gaia positional fallback for <strong>G<sub>BP</sub></strong>/<strong>G<sub>RP</sub></strong>...", "Essai du repli Gaia par position pour <strong>G<sub>BP</sub></strong>/<strong>G<sub>RP</sub></strong>..."), "ok", loading=True)
         ra_deg = parse_float(result.get("ra_deg"))
         dec_deg = parse_float(result.get("dec_deg"))
-        ok_gaia_pos, gaia_pos_vals = await run_with_timeout(fetch_gaia_bp_rp_by_position(ra_deg, dec_deg), 5)
+        ok_gaia_pos, gaia_pos_vals = await run_with_timeout(fetch_gaia_bp_rp_by_position(ra_deg, dec_deg), 15)
         if ok_gaia_pos and gaia_pos_vals is not None:
           gbp2, grp2, gbp_err2, grp_err2 = gaia_pos_vals
           if result.get("GBP_mag") is None and gbp2 is not None:
@@ -3067,7 +3160,7 @@
       if gaia_source_id is None:
         ra_deg = parse_float(result.get("ra_deg"))
         dec_deg = parse_float(result.get("dec_deg"))
-        ok_gaia_src, gaia_src_vals = await run_with_timeout(fetch_gaia_source_by_position(ra_deg, dec_deg), 5)
+        ok_gaia_src, gaia_src_vals = await run_with_timeout(fetch_gaia_source_by_position(ra_deg, dec_deg), 15)
         if ok_gaia_src and gaia_src_vals is not None:
           source_id_pos, gaia_ra_pos, gaia_dec_pos, gaia_pmra_pos, gaia_pmdec_pos, gaia_epoch_pos = gaia_src_vals
           if source_id_pos is not None:
@@ -3086,7 +3179,7 @@
 
       if gaia_source_id is not None:
         set_status(tr("Fetching Gaia DR3 astrophysical parameters for the stellar solution...", "Recuperation des parametres astrophysiques Gaia DR3 pour la solution stellaire..."), "ok", loading=True)
-        ok_gaia_astro, gaia_astro = await run_with_timeout(fetch_gaia_astrophysical_by_id(gaia_source_id), 5)
+        ok_gaia_astro, gaia_astro = await run_with_timeout(fetch_gaia_astrophysical_by_id(gaia_source_id), 10)
         if ok_gaia_astro and gaia_astro is not None:
           for key, value in gaia_astro.items():
             if value is not None:
@@ -3122,7 +3215,7 @@
           wise_radius = 60.0
           set_status(tr("AllWISE xmatch: Gaia PM unavailable, using SIMBAD position with 60 arcsec radius...", "AllWISE xmatch : mouvement propre Gaia indisponible, utilisation de la position SIMBAD avec un rayon de 60 arcsec..."), "ok", loading=True)
 
-        ok_wise_pos, wise_pos_vals = await run_with_timeout(fetch_wise_w1_w2_by_position(ra_wise, dec_wise, wise_radius), 10)
+        ok_wise_pos, wise_pos_vals = await run_with_timeout(fetch_wise_w1_w2_by_position(ra_wise, dec_wise, wise_radius), 20)
         if ok_wise_pos and wise_pos_vals is not None:
           w1p, w1e, w2p, w2e, w3p, w3e, w4p, w4e = wise_pos_vals
           if result.get("W1_mag") is None and w1p is not None:
@@ -3142,7 +3235,7 @@
           if w4e is not None:
             result["W4_err"] = w4e
           if w1p is not None or w2p is not None:
-            autofill_notes.append("Auto-filled missing <strong>W1</strong>/<strong>W2</strong> from CDS/VizieR AllWISE xmatch")
+            autofill_notes.append("Auto-filled missing <strong>W1</strong>/<strong>W2</strong> from AllWISE (VizieR, else GAVO)")
         else:
           autofill_notes.append("CDS/VizieR AllWISE lookup timed out")
 
